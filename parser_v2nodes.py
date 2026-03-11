@@ -16,6 +16,12 @@ api_hash = ""  # TODO: set your api_hash
 
 CHANNEL = "@v2nodes"
 OUTPUT_FILE = Path("valid_keys.txt")
+VALIDATION_URL = "http://captive.apple.com/hotspot-detect.html"
+
+# Optional proxy for URL validation, e.g. "socks5h://127.0.0.1:1080"
+# IMPORTANT: this proxy must be поднят внешним клиентом (sing-box/v2ray/xray),
+# иначе URL-проверка будет обычной проверкой вашего локального интернета.
+URL_CHECK_PROXY = ""
 
 KEY_PATTERN = re.compile(r"^(trojan|hysteria2)://\S+", re.IGNORECASE)
 
@@ -28,11 +34,9 @@ class ParsedKey:
     port: int
 
 
-
 def month_delta(dt: datetime, months: int) -> datetime:
     """Approximate month delta with 30-day windows (good enough for filtering)."""
     return dt - timedelta(days=30 * months)
-
 
 
 def clean_link(line: str) -> str | None:
@@ -41,13 +45,12 @@ def clean_link(line: str) -> str | None:
     if not m:
         return None
 
-    # cut away channel tags/comments after '#'
+    # Cut away channel tags/comments after '#'
     line = line.split("#", 1)[0].strip()
 
-    # remove obvious trailing punctuation/noise
+    # Remove obvious trailing punctuation/noise
     line = re.sub(r"[\s\]\[\)\(,;]+$", "", line)
     return line
-
 
 
 def extract_links(text: str) -> list[str]:
@@ -57,7 +60,6 @@ def extract_links(text: str) -> list[str]:
         if cleaned:
             links.append(cleaned)
     return links
-
 
 
 def parse_host_port(link: str) -> ParsedKey | None:
@@ -77,7 +79,6 @@ def parse_host_port(link: str) -> ParsedKey | None:
         return None
 
 
-
 def tcp_check(host: str, port: int, timeout: float = 2.5) -> bool:
     try:
         with socket.create_connection((host, port), timeout=timeout):
@@ -86,10 +87,11 @@ def tcp_check(host: str, port: int, timeout: float = 2.5) -> bool:
         return False
 
 
-
-def captive_check(timeout: float = 5.0) -> bool:
+def captive_check_via_proxy(proxy_url: str, timeout: float = 8.0) -> bool:
+    """Check URL through a preconfigured local proxy (if provided by user)."""
     try:
-        resp = requests.get("http://captive.apple.com/hotspot-detect.html", timeout=timeout)
+        proxies = {"http": proxy_url, "https": proxy_url}
+        resp = requests.get(VALIDATION_URL, timeout=timeout, proxies=proxies)
         return resp.status_code == 200 and "Success" in resp.text
     except requests.RequestException:
         return False
@@ -118,19 +120,30 @@ async def collect_keys() -> list[str]:
                 if text:
                     collected.extend(extract_links(text))
 
-    # deduplicate while preserving order
+    # Deduplicate while preserving order
     seen = set()
     uniq = []
-    for k in collected:
-        if k not in seen:
-            seen.add(k)
-            uniq.append(k)
+    for key in collected:
+        if key not in seen:
+            seen.add(key)
+            uniq.append(key)
     return uniq
 
 
+def validate_keys(keys: Iterable[str], proxy_url: str = "") -> list[str]:
+    """
+    Validation steps:
+      1) TCP check against host:port from key.
+      2) Optional URL check via user-supplied local proxy endpoint.
 
-def validate_keys(keys: Iterable[str]) -> list[str]:
+    By requirement, we keep keys that passed port check.
+    URL check is informational and works only if `proxy_url` is set correctly.
+    """
     valid: list[str] = []
+    url_check_enabled = bool(proxy_url)
+
+    if not url_check_enabled:
+        print("[INFO] URL-check отключен: задайте URL_CHECK_PROXY, если хотите проверять через локальный proxy-клиент.")
 
     for link in keys:
         parsed = parse_host_port(link)
@@ -142,12 +155,16 @@ def validate_keys(keys: Iterable[str]) -> list[str]:
             print(f"[DEAD] {parsed.host}:{parsed.port}")
             continue
 
-        step2 = captive_check()
-        if step2:
-            valid.append(parsed.raw)
-            print(f"[OK]   {parsed.host}:{parsed.port}")
+        valid.append(parsed.raw)
+
+        if url_check_enabled:
+            step2 = captive_check_via_proxy(proxy_url)
+            if step2:
+                print(f"[OK]   {parsed.host}:{parsed.port} | URL OK")
+            else:
+                print(f"[OK]   {parsed.host}:{parsed.port} | URL FAIL")
         else:
-            print(f"[DEAD] {parsed.host}:{parsed.port} (captive check failed)")
+            print(f"[OK]   {parsed.host}:{parsed.port} | URL SKIP")
 
     return valid
 
@@ -161,9 +178,9 @@ async def main() -> None:
         print("Проверка отменена пользователем.")
         return
 
-    valid = validate_keys(keys)
+    valid = validate_keys(keys, proxy_url=URL_CHECK_PROXY.strip())
     OUTPUT_FILE.write_text("\n".join(valid), encoding="utf-8")
-    print(f"Готово. Валидных ключей: {len(valid)}")
+    print(f"Готово. Ключей с открытым портом: {len(valid)}")
     print(f"Сохранено в: {OUTPUT_FILE.resolve()}")
 
 
