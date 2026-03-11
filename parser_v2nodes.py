@@ -1,13 +1,15 @@
 import asyncio
+import json
+import random
 import re
-import socket
+import subprocess
+import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Iterable
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
-import requests
 from telethon import TelegramClient
 
 # === Telegram credentials ===
@@ -17,11 +19,8 @@ api_hash = ""  # TODO: set your api_hash
 CHANNEL = "@v2nodes"
 OUTPUT_FILE = Path("valid_keys.txt")
 VALIDATION_URL = "http://captive.apple.com/hotspot-detect.html"
-
-# Optional proxy for URL validation, e.g. "socks5h://127.0.0.1:1080"
-# IMPORTANT: this proxy must be поднят внешним клиентом (sing-box/v2ray/xray),
-# иначе URL-проверка будет обычной проверкой вашего локального интернета.
-URL_CHECK_PROXY = ""
+SING_BOX_BIN = "sing-box"
+SINGBOX_START_TIMEOUT_SEC = 4.0
 
 KEY_PATTERN = re.compile(r"^(trojan|hysteria2)://\S+", re.IGNORECASE)
 
@@ -32,69 +31,144 @@ class ParsedKey:
     protocol: str
     host: str
     port: int
+    user: str
+    params: dict[str, list[str]]
 
 
 def month_delta(dt: datetime, months: int) -> datetime:
-    """Approximate month delta with 30-day windows (good enough for filtering)."""
     return dt - timedelta(days=30 * months)
 
 
 def clean_link(line: str) -> str | None:
     line = line.strip()
-    m = KEY_PATTERN.match(line)
-    if not m:
+    if not KEY_PATTERN.match(line):
         return None
-
-    # Cut away channel tags/comments after '#'
     line = line.split("#", 1)[0].strip()
-
-    # Remove obvious trailing punctuation/noise
     line = re.sub(r"[\s\]\[\)\(,;]+$", "", line)
     return line
 
 
 def extract_links(text: str) -> list[str]:
-    links: list[str] = []
-    for ln in text.splitlines():
-        cleaned = clean_link(ln)
-        if cleaned:
-            links.append(cleaned)
-    return links
+    return [cleaned for ln in text.splitlines() if (cleaned := clean_link(ln))]
 
 
-def parse_host_port(link: str) -> ParsedKey | None:
+def parse_key(link: str) -> ParsedKey | None:
     try:
         parts = urlsplit(link)
         protocol = parts.scheme.lower()
         if protocol not in {"trojan", "hysteria2"}:
             return None
-
         host = parts.hostname
         port = parts.port
-        if not host or not port:
+        user = unquote(parts.username or "")
+        if not host or not port or not user:
             return None
-
-        return ParsedKey(raw=link, protocol=protocol, host=host, port=port)
+        return ParsedKey(
+            raw=link,
+            protocol=protocol,
+            host=host,
+            port=port,
+            user=user,
+            params=parse_qs(parts.query),
+        )
     except Exception:
         return None
 
 
-def tcp_check(host: str, port: int, timeout: float = 2.5) -> bool:
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
+def _pick_local_port() -> int:
+    return random.randint(20000, 50000)
 
 
-def captive_check_via_proxy(proxy_url: str, timeout: float = 8.0) -> bool:
-    """Check URL through a preconfigured local proxy (if provided by user)."""
-    try:
-        proxies = {"http": proxy_url, "https": proxy_url}
-        resp = requests.get(VALIDATION_URL, timeout=timeout, proxies=proxies)
-        return resp.status_code == 200 and "Success" in resp.text
-    except requests.RequestException:
-        return False
+def build_outbound(parsed: ParsedKey) -> dict:
+    insecure = parsed.params.get("insecure", ["0"])[0] in {"1", "true"}
+    sni = parsed.params.get("sni", [""])[0] or parsed.params.get("peer", [""])[0]
+
+    if parsed.protocol == "trojan":
+        tls_cfg = {"enabled": True, "insecure": insecure}
+        if sni:
+            tls_cfg["server_name"] = sni
+        return {
+            "type": "trojan",
+            "tag": "proxy",
+            "server": parsed.host,
+            "server_port": parsed.port,
+            "password": parsed.user,
+            "tls": tls_cfg,
+        }
+
+    obfs = parsed.params.get("obfs", [""])[0]
+    outbound = {
+        "type": "hysteria2",
+        "tag": "proxy",
+        "server": parsed.host,
+        "server_port": parsed.port,
+        "password": parsed.user,
+        "tls": {"enabled": True, "insecure": insecure},
+    }
+    if sni:
+        outbound["tls"]["server_name"] = sni
+    if obfs == "salamander":
+        obfs_password = parsed.params.get("obfs-password", [""])[0]
+        if obfs_password:
+            outbound["obfs"] = {"type": "salamander", "password": obfs_password}
+    return outbound
+
+
+def build_config(parsed: ParsedKey, socks_port: int) -> dict:
+    return {
+        "log": {"level": "error"},
+        "inbounds": [
+            {
+                "type": "socks",
+                "tag": "socks-in",
+                "listen": "127.0.0.1",
+                "listen_port": socks_port,
+            }
+        ],
+        "outbounds": [build_outbound(parsed)],
+        "route": {"final": "proxy"},
+    }
+
+
+def check_url_via_singbox(parsed: ParsedKey) -> bool:
+    socks_port = _pick_local_port()
+    config = build_config(parsed, socks_port)
+
+    with tempfile.TemporaryDirectory(prefix="sb-check-") as td:
+        config_path = Path(td) / "config.json"
+        config_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+
+        proc = subprocess.Popen(
+            [SING_BOX_BIN, "run", "-c", str(config_path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        try:
+            start_at = time.time()
+            while time.time() - start_at < SINGBOX_START_TIMEOUT_SEC:
+                if proc.poll() is not None:
+                    return False
+                time.sleep(0.15)
+
+            curl_cmd = [
+                "curl",
+                "--silent",
+                "--show-error",
+                "--max-time",
+                "12",
+                "--proxy",
+                f"socks5h://127.0.0.1:{socks_port}",
+                VALIDATION_URL,
+            ]
+            result = subprocess.run(curl_cmd, capture_output=True, text=True)
+            return result.returncode == 0 and "Success" in result.stdout
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
 
 
 async def collect_keys() -> list[str]:
@@ -106,21 +180,16 @@ async def collect_keys() -> list[str]:
     end_dt = month_delta(now, 3)
 
     collected: list[str] = []
-
     async with TelegramClient("v2nodes_session", api_id, api_hash) as client:
         async for message in client.iter_messages(CHANNEL):
             if not message.date:
                 continue
-
             msg_dt = message.date.replace(tzinfo=None)
             if msg_dt < start_dt:
                 break
             if start_dt <= msg_dt <= end_dt:
-                text = message.message or ""
-                if text:
-                    collected.extend(extract_links(text))
+                collected.extend(extract_links(message.message or ""))
 
-    # Deduplicate while preserving order
     seen = set()
     uniq = []
     for key in collected:
@@ -130,41 +199,19 @@ async def collect_keys() -> list[str]:
     return uniq
 
 
-def validate_keys(keys: Iterable[str], proxy_url: str = "") -> list[str]:
-    """
-    Validation steps:
-      1) TCP check against host:port from key.
-      2) Optional URL check via user-supplied local proxy endpoint.
-
-    By requirement, we keep keys that passed port check.
-    URL check is informational and works only if `proxy_url` is set correctly.
-    """
+def validate_keys(keys: list[str]) -> list[str]:
     valid: list[str] = []
-    url_check_enabled = bool(proxy_url)
-
-    if not url_check_enabled:
-        print("[INFO] URL-check отключен: задайте URL_CHECK_PROXY, если хотите проверять через локальный proxy-клиент.")
-
     for link in keys:
-        parsed = parse_host_port(link)
+        parsed = parse_key(link)
         if not parsed:
             continue
 
-        step1 = tcp_check(parsed.host, parsed.port)
-        if not step1:
-            print(f"[DEAD] {parsed.host}:{parsed.port}")
-            continue
-
-        valid.append(parsed.raw)
-
-        if url_check_enabled:
-            step2 = captive_check_via_proxy(proxy_url)
-            if step2:
-                print(f"[OK]   {parsed.host}:{parsed.port} | URL OK")
-            else:
-                print(f"[OK]   {parsed.host}:{parsed.port} | URL FAIL")
+        ok = check_url_via_singbox(parsed)
+        if ok:
+            valid.append(link)
+            print(f"[OK]   {parsed.host}:{parsed.port}")
         else:
-            print(f"[OK]   {parsed.host}:{parsed.port} | URL SKIP")
+            print(f"[DEAD] {parsed.host}:{parsed.port}")
 
     return valid
 
@@ -178,9 +225,9 @@ async def main() -> None:
         print("Проверка отменена пользователем.")
         return
 
-    valid = validate_keys(keys, proxy_url=URL_CHECK_PROXY.strip())
+    valid = validate_keys(keys)
     OUTPUT_FILE.write_text("\n".join(valid), encoding="utf-8")
-    print(f"Готово. Ключей с открытым портом: {len(valid)}")
+    print(f"Готово. Валидных ключей: {len(valid)}")
     print(f"Сохранено в: {OUTPUT_FILE.resolve()}")
 
 
